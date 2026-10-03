@@ -121,9 +121,14 @@ def test_failure_rolls_back_whole_batch(db):
     conn = sqlite3.connect(db)
     names = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")]
     assert "ok" not in names
-    assert conn.execute(
-        f"SELECT COUNT(*) FROM {MIGRATION_TABLE}"
-    ).fetchone()[0] == 0
+    # 迁移记录表与整批在同一事务中，回滚后不存在或为空
+    count = conn.execute(
+        f"SELECT COUNT(*) FROM sqlite_master WHERE name = '{MIGRATION_TABLE}'"
+    ).fetchone()[0]
+    if count:
+        assert conn.execute(
+            f"SELECT COUNT(*) FROM {MIGRATION_TABLE}"
+        ).fetchone()[0] == 0
     conn.close()
 
 
@@ -217,3 +222,34 @@ def test_multi_statement_trigger_runs(db):
     rows = conn.execute("SELECT msg FROM log ORDER BY id").fetchall()
     assert rows == [("a;b",), ("c",)]
     conn.close()
+def test_deferred_foreign_key_cross_script_fix(tmp_path):
+    p = tmp_path / "fk2.db"
+    conn = sqlite3.connect(p)
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("CREATE TABLE p (id INTEGER PRIMARY KEY)")
+    conn.execute(
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED)"
+    )
+    conn.execute("INSERT INTO p VALUES (1)")
+    conn.execute("INSERT INTO c VALUES (1, 1)")
+    conn.commit()
+    conn.close()
+    # 脚本1 先破坏（删父行），脚本2 末尾修复：整批末尾校验应放行
+    m = manifest(
+        [
+            "DELETE FROM p WHERE id = 1;",
+            "INSERT INTO p VALUES (1);",
+        ]
+    )
+    m.expected_version = 0
+    result = apply_manifest(p, m, DatabaseRegistry().lock_for("d"))
+    assert result.applied == [1, 2]
+
+
+def test_forbidden_sql_is_business_error(db):
+    m = manifest(["PRAGMA journal_mode=WAL;"])
+    m.expected_version = 0
+    with pytest.raises(ScriptFailed) as exc:
+        apply_manifest(db, m, DatabaseRegistry().lock_for("x"))
+    assert exc.value.version == 1
+    assert "forbidden" in exc.value.reason

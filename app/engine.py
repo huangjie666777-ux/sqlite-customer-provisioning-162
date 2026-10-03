@@ -146,11 +146,27 @@ def apply_manifest(
         return _apply_locked(db_path, manifest)
 
 
+def _is_busy(exc: sqlite3.Error) -> bool:
+    msg = str(exc).lower()
+    return "locked" in msg or "busy" in msg
+
+
+def _allow_all(*_args):
+    return sqlite3.SQLITE_OK
+
+
 def _apply_locked(db_path: Path, manifest: MigrationManifest) -> ApplyResult:
     with closing(_connect(db_path)) as conn:
+        conn.execute("PRAGMA busy_timeout = %d" % int(SQLITE_BUSY_TIMEOUT_SECONDS * 1000))
+        conn.execute("PRAGMA foreign_keys = ON")
         try:
-            conn.execute("PRAGMA busy_timeout = %d" % int(SQLITE_BUSY_TIMEOUT_SECONDS * 1000))
-            conn.execute("PRAGMA foreign_keys = ON")
+            # 先取得数据库写锁，再检查版本与历史，避免检查与执行之间被改写。
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as exc:
+            if _is_busy(exc):
+                raise DatabaseBusy(str(exc)) from exc
+            raise
+        try:
             _ensure_table(conn)
             records = _read_records(conn)
             current = records[-1].version if records else 0
@@ -162,76 +178,65 @@ def _apply_locked(db_path: Path, manifest: MigrationManifest) -> ApplyResult:
             _check_history(records, manifest.scripts)
 
             pending = manifest.scripts[current:]
-            before = current
-
             if not pending:
+                conn.execute("COMMIT")
                 return ApplyResult(
-                    before_version=before, after_version=current, applied=[]
+                    before_version=current, after_version=current, applied=[]
                 )
 
             # 全部待执行脚本先做语句层校验，任何一条不合法都不动数据库。
+            # 禁用 SQL 统一折算为带失败版本号的业务错误，不向上抛 500。
             parsed: list[tuple[MigrationItem, list[str]]] = []
-            authorizer = make_authorizer(MIGRATION_TABLE)
-            def _allow_all(*_args):
-                return sqlite3.SQLITE_OK
-
             for item in pending:
-                statements = inspect_script(item.sql, MIGRATION_TABLE)
+                try:
+                    statements = inspect_script(item.sql, MIGRATION_TABLE)
+                except GuardError as exc:
+                    raise ScriptFailed(item.version, str(exc)) from exc
                 parsed.append((item, statements))
 
+            authorizer = make_authorizer(MIGRATION_TABLE)
             conn.set_authorizer(authorizer)
-            try:
-                conn.execute("BEGIN IMMEDIATE")
-                applied: list[int] = []
-                for item, statements in parsed:
-                    try:
-                        for stmt in statements:
-                            conn.execute(stmt)
-                        # 每条脚本后立刻核对外键完整性，违反则整批回滚。
-                        conn.set_authorizer(_allow_all)
-                        violations = conn.execute("PRAGMA foreign_key_check").fetchall()
-                        conn.set_authorizer(authorizer)
-                        if violations:
-                            detail = ", ".join(
-                                f"table={v[0]} rowid={v[1]} target={v[2]} fkid={v[3]}"
-                                for v in violations[:5]
-                            )
-                            raise ScriptFailed(
-                                item.version, f"foreign key violation: {detail}"
-                            )
-                        conn.set_authorizer(_allow_all)
-                        conn.execute(
-                            f"INSERT INTO {MIGRATION_TABLE} (version, description, sql_sha256) "
-                            "VALUES (?, ?, ?)",
-                            (item.version, item.description, sql_digest(item.sql)),
-                        )
-                        conn.set_authorizer(authorizer)
-                        applied.append(item.version)
-                    except ScriptFailed:
-                        raise
-                    except sqlite3.Error as exc:
-                        if "foreign key" in str(exc).lower():
-                            raise ScriptFailed(
-                                item.version, "foreign key constraint violation"
-                            ) from exc
-                        raise ScriptFailed(item.version, str(exc)) from exc
-                conn.execute("COMMIT")
-            except Exception:
+            applied: list[int] = []
+            for item, statements in parsed:
                 try:
-                    conn.execute("ROLLBACK")
-                except sqlite3.Error:
-                    pass
-                raise
-            finally:
+                    for stmt in statements:
+                        conn.execute(stmt)
+                except sqlite3.Error as exc:
+                    if "foreign key" in str(exc).lower():
+                        raise ScriptFailed(
+                            item.version, "foreign key constraint violation"
+                        ) from exc
+                    raise ScriptFailed(item.version, str(exc)) from exc
                 conn.set_authorizer(_allow_all)
+                conn.execute(
+                    f"INSERT INTO {MIGRATION_TABLE} (version, description, sql_sha256) "
+                    "VALUES (?, ?, ?)",
+                    (item.version, item.description, sql_digest(item.sql)),
+                )
+                conn.set_authorizer(authorizer)
+                applied.append(item.version)
 
-            return ApplyResult(
-                before_version=before,
-                after_version=before + len(applied),
-                applied=applied,
-            )
-        except sqlite3.OperationalError as exc:
-            msg = str(exc).lower()
-            if "locked" in msg or "busy" in msg:
-                raise DatabaseBusy(str(exc)) from exc
+            # 延迟外键：整批末尾统一校验，允许跨脚本先破坏后修复的合法序列。
+            conn.set_authorizer(_allow_all)
+            violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                detail = ", ".join(
+                    f"table={v[0]} rowid={v[1]} target={v[2]} fkid={v[3]}"
+                    for v in violations[:5]
+                )
+                raise ScriptFailed(applied[-1], f"foreign key violation: {detail}")
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
             raise
+        finally:
+            conn.set_authorizer(_allow_all)
+
+        return ApplyResult(
+            before_version=manifest.expected_version,
+            after_version=manifest.expected_version + len(applied),
+            applied=applied,
+        )

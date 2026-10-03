@@ -1,12 +1,18 @@
-"""FastAPI 入口：提交迁移清单 / 查询当前版本。"""
+"""FastAPI 入口：提交迁移清单 / 查询当前版本 / 检查点与整库恢复。"""
 
 from __future__ import annotations
 
 from fastapi import FastAPI, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
-from pydantic import ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
+from .checkpoints import (
+    CheckpointAliasMismatch,
+    CheckpointCorrupt,
+    CheckpointStore,
+    UnknownCheckpoint,
+)
 from .config import MAX_REQUEST_BYTES, load_settings
 from .engine import (
     DatabaseBusy,
@@ -22,6 +28,7 @@ from .manifest import MigrationManifest
 
 settings = load_settings()
 registry = DatabaseRegistry()
+checkpoints = CheckpointStore(settings.checkpoint_dir)
 
 app = FastAPI(title="SQLite Migration Backend", version="1.0.0")
 
@@ -52,6 +59,15 @@ async def _migration_error_handler(_: Request, exc: MigrationError) -> JSONRespo
     elif isinstance(exc, ScriptFailed):
         status_code = 422
         code = "migration_failed"
+    elif isinstance(exc, UnknownCheckpoint):
+        status_code = 404
+        code = "unknown_checkpoint"
+    elif isinstance(exc, CheckpointAliasMismatch):
+        status_code = 409
+        code = "checkpoint_alias_mismatch"
+    elif isinstance(exc, CheckpointCorrupt):
+        status_code = 422
+        code = "checkpoint_corrupt"
     else:
         status_code = 400
         code = "migration_error"
@@ -109,4 +125,54 @@ async def migrate(alias: str, request: Request):
         "after_version": result.after_version,
         "applied_versions": result.applied,
         "already_applied": not result.applied,
+    }
+
+
+class RestoreRequest(BaseModel):
+    checkpoint_id: str = Field(min_length=1)
+    expected_version: int = Field(ge=0)
+
+
+@app.post("/databases/{alias}/checkpoints", status_code=201)
+async def create_checkpoint(alias: str):
+    resolved = _resolve(alias)
+    if isinstance(resolved, JSONResponse):
+        return resolved
+    meta = checkpoints.create(alias, resolved, registry.lock_for(alias))
+    return meta
+
+
+@app.get("/databases/{alias}/checkpoints")
+async def list_checkpoints(alias: str):
+    resolved = _resolve(alias)
+    if isinstance(resolved, JSONResponse):
+        return resolved
+    return {"alias": alias, "checkpoints": checkpoints.list(alias)}
+
+
+@app.post("/databases/{alias}/restore")
+async def restore_checkpoint(alias: str, request: Request):
+    resolved = _resolve(alias)
+    if isinstance(resolved, JSONResponse):
+        return resolved
+    raw = await request.body()
+    try:
+        payload = RestoreRequest.model_validate_json(raw)
+    except ValidationError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={"detail": jsonable_encoder(exc.errors()), "code": "invalid_restore_request"},
+        )
+    result = checkpoints.restore(
+        alias,
+        resolved,
+        payload.checkpoint_id,
+        payload.expected_version,
+        registry.lock_for(alias),
+    )
+    return {
+        "alias": alias,
+        "checkpoint_id": result["checkpoint"]["id"],
+        "before_version": result["before_version"],
+        "after_version": result["after_version"],
     }

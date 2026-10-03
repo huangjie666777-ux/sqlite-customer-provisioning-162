@@ -12,6 +12,10 @@
 - **执行保护**（`app/guard.py`）：保护基于 SQLite 授权回调（`set_authorizer`），不是关键词文本搜索。禁止脚本使用事务控制（`BEGIN/COMMIT/ROLLBACK/SAVEPOINT/RELEASE/END`）、`ATTACH/DETACH`、`PRAGMA`、`VACUUM`、非白名单函数（含 `load_extension`，扩展加载被阻断），禁止读写迁移记录表（包括在迁移记录表上建触发器等间接途径），限制只能访问主库。
 - **外键约束**：连接强制 `PRAGMA foreign_keys = ON`，每条脚本执行后做 `PRAGMA foreign_key_check`，违规则回滚整批。
 - **并发保护**：进程内每个别名一把锁串行化“版本检查 + 执行”；数据库层使用 `BEGIN IMMEDIATE` 与 `busy_timeout` 协调跨进程写锁。并发提交不会重复应用或绕过预期版本；忙（`database is locked`）返回 503，预期版本不匹配返回 409。
+- **先锁后检**：迁移在 `BEGIN IMMEDIATE` 取得数据库写锁之后才检查预期版本与历史指纹，检查与执行之间不会被其它写入者改写。
+- **延迟外键**：外键完整性在整批末尾统一 `PRAGMA foreign_key_check`，允许跨脚本“先破坏后修复”的合法序列；末尾仍违规则整批回滚并返回失败版本。
+- **检查点**（`app/checkpoints.py`）：部署前可按别名创建整库一致性快照。快照经 SQLite 在线备份 API 生成，包含应用表、数据、索引、触发器、迁移记录以及已提交的 WAL 数据，不是复制主文件。ID 由服务生成，绑定别名、迁移版本、创建时间和快照 SHA256；目录（`catalog.json`）与快照文件持久保存在应用库之外的 `checkpoint_dir`，重启可查询，历史快照只增不改，临时/不完整快照不出现在列表中。
+- **整库恢复**：按 ID 恢复，必须携带预期当前版本且只能恢复同一别名的检查点。恢复前校验快照 SHA256 与 `PRAGMA integrity_check`，在目标旁的临时文件重建并再次校验后原子替换原库；恢复后新增对象与数据消失，版本与历史回到检查点，快照与目录保留，可再次迁移。任何失败（未知 ID、别名不符、版本冲突、快照损坏、库忙）都明确拒绝且原库不变，不留半恢复库。
 - **重启可查**：版本状态全部来自库内真实记录，服务重启后直接读取。
 - **短连接**：每次请求使用独立连接并在结束后关闭（`contextlib.closing`）。
 
@@ -24,6 +28,7 @@ app/
   sqlsplit.py    SQL 词法切分/首关键字
   guard.py       语句层禁止项 + SQLite 授权回调
   engine.py      版本读取、历史核对、事务化应用
+  checkpoints.py 检查点快照、目录持久化与原子恢复
   main.py        FastAPI 路由
 scripts/make_example_db.py  生成示例库
 examples/      演示用清单
@@ -36,6 +41,9 @@ aliases.json   别名 -> 库文件映射（路径相对于该文件）
 - `GET  /health`
 - `GET  /databases/{alias}/version` — 当前版本和每条已应用记录（版本/说明/摘要）
 - `POST /databases/{alias}/migrate` — 提交完整清单
+- `POST /databases/{alias}/checkpoints` — 创建检查点，返回 `id/alias/version/created_at/sha256/size_bytes`
+- `GET  /databases/{alias}/checkpoints` — 列出该别名可见检查点
+- `POST /databases/{alias}/restore` — 按 ID 整库恢复，请求体 `{"checkpoint_id": "...", "expected_version": N}`
 
 请求体：
 
@@ -48,7 +56,7 @@ aliases.json   别名 -> 库文件映射（路径相对于该文件）
 }
 ```
 
-错误码：`invalid_manifest`(422)、`history_mismatch`(422)、`migration_failed`(422，含 `failed_version`/`reason`)、`version_conflict`(409)、`database_busy`(503)、`unknown_alias`(404)、请求体超限 413。
+错误码：`invalid_manifest`(422)、`history_mismatch`(422)、`migration_failed`(422，含 `failed_version`/`reason`，禁用 SQL 也走此码而非 500)、`version_conflict`(409)、`database_busy`(503)、`unknown_alias`(404)、`unknown_checkpoint`(404)、`checkpoint_alias_mismatch`(409)、`checkpoint_corrupt`(422)、请求体超限 413。
 
 ## 运行
 
@@ -77,6 +85,17 @@ curl -s -X POST http://127.0.0.1:8011/databases/billing/migrate \
 # 7. 篡改迁移记录表被拒
 curl -s -X POST http://127.0.0.1:8011/databases/billing/migrate \
   -H 'Content-Type: application/json' --data @examples/manifests_forbidden.json
+
+# 8. 部署前创建检查点（返回服务生成的 id）
+curl -s -X POST http://127.0.0.1:8011/databases/demo/checkpoints
+
+# 9. 列出检查点
+curl -s http://127.0.0.1:8011/databases/demo/checkpoints
+
+# 10. 升级后整库恢复到检查点（expected_version 为当前版本）
+curl -s -X POST http://127.0.0.1:8011/databases/demo/restore \
+  -H 'Content-Type: application/json' \
+  -d `'{"checkpoint_id": "cp_...", "expected_version": 2}'`
 ```
 
 ## 测试
@@ -93,6 +112,7 @@ curl -s -X POST http://127.0.0.1:8011/databases/billing/migrate \
 - `MIGRATION_MAX_REQUEST_BYTES`（默认 2 MiB）
 - `MIGRATION_MAX_SCRIPTS`（默认 200）
 - `MIGRATION_SQLITE_TIMEOUT`（busy_timeout，默认 5 秒）
+- `MIGRATION_CHECKPOINT_DIR`（检查点目录，默认 `<配置目录>/checkpoints`，必须在应用库之外）
 
 ## 说明与边界
 

@@ -25,6 +25,7 @@ MIGRATION_TABLE = "__schema_migration_log__"
 @dataclass(frozen=True)
 class Settings:
     aliases: dict[str, Path]
+    checkpoint_dir: Path
 
 
 def load_settings(path: str | os.PathLike[str] | None = None) -> Settings:
@@ -40,4 +41,19 @@ def load_settings(path: str | os.PathLike[str] | None = None) -> Settings:
         aliases[alias] = p.resolve()
     if not aliases:
         raise ValueError("aliases.json must define at least one alias")
-    return Settings(aliases=aliases)
+    # 检查点目录必须在应用库之外；默认 <配置目录>/checkpoints，可用
+    # aliases.json 的 "checkpoint_dir" 或 MIGRATION_CHECKPOINT_DIR 覆盖。
+    raw_dir = os.environ.get("MIGRATION_CHECKPOINT_DIR") or raw.get("checkpoint_dir")
+    if raw_dir:
+        checkpoint_dir = Path(raw_dir)
+        if not checkpoint_dir.is_absolute():
+            checkpoint_dir = cfg_path.parent / checkpoint_dir
+    else:
+        checkpoint_dir = cfg_path.parent / "checkpoints"
+    checkpoint_dir = checkpoint_dir.resolve()
+    for alias, db_path in aliases.items():
+        if db_path == checkpoint_dir or checkpoint_dir in db_path.parents:
+            raise ValueError(
+                f"checkpoint_dir must not contain database files: {alias}"
+            )
+    return Settings(aliases=aliases, checkpoint_dir=checkpoint_dir)
