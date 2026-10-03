@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.cache/
+*.log
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+.env
+.env.*
+*.key
+*.pem
