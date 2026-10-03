@@ -1,0 +1,15 @@
+{
+  "expected_version": 2,
+  "scripts": [
+    {
+      "version": 1,
+      "description": "add email column and seed it",
+      "sql": "-- 第一条迁移；分号在注释里不切分\nALTER TABLE users ADD COLUMN email TEXT;\nUPDATE users SET email = id || '@example.com';"
+    },
+    {
+      "version": 2,
+      "description": "create audit table with a multi-statement trigger",
+      "sql": "CREATE TABLE user_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, msg TEXT);\nCREATE TRIGGER users_audit_ins AFTER INSERT ON users\nBEGIN\n  INSERT INTO user_audit(msg) VALUES ('inserted; semicolon inside body');\n  INSERT INTO user_audit(msg) VALUES ('second statement');\nEND;\nINSERT INTO users (id, name, email) VALUES (3, 'carol', 'c@example.com');"
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "expected_version": 0,
+  "scripts": [
+    {
+      "version": 1,
+      "description": "add invoice table; succeeds",
+      "sql": "CREATE TABLE invoices (id INTEGER PRIMARY KEY, amount INTEGER NOT NULL);\nINSERT INTO invoices (id, amount) VALUES (1, 100);"
+    },
+    {
+      "version": 2,
+      "description": "orphan child violates foreign key -> whole batch rolls back",
+      "sql": "INSERT INTO orders (id, customer_id) VALUES (99, 999);"
+    }
+  ]
+}

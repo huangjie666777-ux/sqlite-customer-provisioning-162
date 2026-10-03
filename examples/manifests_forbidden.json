@@ -1,0 +1,10 @@
+{
+  "expected_version": 0,
+  "scripts": [
+    {
+      "version": 1,
+      "description": "attempt to tamper with migration log - must be rejected",
+      "sql": "INSERT INTO __schema_migration_log__ (version, description, sql_sha256) VALUES (99, 'fake', 'deadbeef');"
+    }
+  ]
+}

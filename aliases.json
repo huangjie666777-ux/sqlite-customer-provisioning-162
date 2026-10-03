@@ -1,0 +1,6 @@
+{
+  "aliases": {
+    "demo": "data/demo.db",
+    "billing": "data/billing.db"
+  }
+}
