@@ -2,5 +2,9 @@
   "aliases": {
     "demo": "data/demo.db",
     "billing": "data/billing.db"
+  },
+  "review_credentials": {
+    "change-me-alice": "alice",
+    "change-me-bob": "bob"
   }
 }

@@ -25,6 +25,9 @@
 - **双人审核发布**（`app/review.py`，默认关闭）：开启后，创建发布单必须携带服务端配置的 Bearer 凭据；人员只由凭据映射决定，不接受请求内署名。发布单保存有序库别名、预期版本、完整清单、原始 SQL 与规范化内容 SHA256，一经提交不可修改。另一人批准时必须回传所查看的 SHA256；作者不能审核，摘要不符或并发状态变化均拒绝。作者可在执行开始前撤销；批准/拒绝/撤销/执行通过 SQLite 条件更新和进程内条件变量收敛到一致终态。
 - **按单执行与防偷换**：执行请求只包含发布单 ID，协调器从仓储读取批准时的原始方案，不接受请求携带 SQL。执行在原有全局批次锁和库锁内重新预检版本与历史，审批后库已变化则不执行；并发/重复执行最多关联一个批次并返回同一结果。失败终态不自动重跑；服务在执行中断后将发布单与批次标记为 `undecided`，不重放 SQL、不虚报成功，批次关联不丢失。
 - **审核模式旁路关闭**：启用审核后，`POST /batches`、单库 `POST /migrate` 与 `POST /restore` 均返回 403；检查点查询和版本读取仍可用于审计。未启用时原接口和行为保持不变。
+- **新客户库开通**（`app/provisioning.py`）：持 Bearer 人员凭据提交成功发布单 ID、来源别名、新别名与幂等键。服务端只从成功发布单提取该别名的完整 SQL 清单和摘要，不接收新 SQL 或宿主路径；待审、拒绝、失败、未决发布单均不能作为来源。新库在服务端开通根目录以独占方式创建，从空库版本 0 应用完整清单，不复制源库业务数据，也不修改发布单、批次或源库。
+- **开通原子可见性**：开通记录先持久化为 `processing`；库文件创建、全部 SQL 与迁移历史提交成功后才把新别名加入运行时解析。失败保留错误且重复请求返回同一失败记录，不自动重试；重启时未完成记录改为 `undecided`，不开放别名、不重放 SQL。成功记录重启后恢复别名。
+- **开通幂等与冲突**：同一幂等键和相同请求返回同一开通记录；换内容返回 409。新别名不得与静态或已开通别名冲突，不允许路径越界，也不覆盖已有文件。成功后的新别名立即支持版本查询、检查点、恢复（非审核模式）及后续审核发布。
 
 ## 目录结构
 
@@ -38,10 +41,11 @@ app/
   checkpoints.py 检查点快照、目录持久化与原子恢复
   batch.py       多库批次协调、批次日志持久化与失败补偿
   review.py      双人审核发布单、凭据身份和审核状态流
+  provisioning.py 成功发布单初始化空客户库、开通记录与动态别名
   main.py        FastAPI 路由
 scripts/make_example_db.py  生成示例库
 examples/      演示用清单
-tests/         pytest 测试（48 项）
+  tests/         pytest 测试（59 项）
 aliases.json   别名 -> 库文件映射（路径相对于该文件）
 ```
 
@@ -61,7 +65,9 @@ aliases.json   别名 -> 库文件映射（路径相对于该文件）
 - `POST /releases/{release_id}/approve` — 他人批准，请求体 `{"content_sha256": "..."}`
 - `POST /releases/{release_id}/reject` — 他人拒绝，携带同一内容摘要；作者审核或摘要不符均拒绝
 - `POST /releases/{release_id}/cancel` — 作者撤销尚未开始执行的发布单
-- `POST /releases/{release_id}/execute` — 仅路径包含发布单 ID，不接受 SQL 或方案；重复调用返回同一批次结果
+- `POST /releases/{release_id}/execute` — 仅路径包含发布单 ID 和 Bearer 人员凭据，不接受 SQL 或方案；重复调用返回同一批次结果
+- `POST /provisionings` — 从成功发布单开通空客户库，请求体 `{"release_id", "source_alias", "new_alias", "idempotency_key"}`
+- `GET /provisionings` / `GET /provisionings/{provisioning_id}` — 使用有效 Bearer 凭据查询开通记录、来源摘要、版本、状态和错误
 
 请求体：
 
@@ -74,7 +80,7 @@ aliases.json   别名 -> 库文件映射（路径相对于该文件）
 }
 ```
 
-错误码：`invalid_manifest`(422)、`invalid_batch`(422)、`history_mismatch`(422)、`migration_failed`(422，含 `failed_version`/`reason`，禁用 SQL——包括含未闭合字符串的脚本——也走此码而非 500)、`version_conflict`(409)、`database_busy`(503)、`unknown_alias`(404)、`unknown_checkpoint`(404)、`unknown_batch`(404)、`checkpoint_alias_mismatch`(409)、`checkpoint_corrupt`(422)、审核相关 `unauthorized`(401)、`review_required`(403)、`forbidden`(403)、`self_review`(409)、`digest_mismatch`(409)、`invalid_release_state`(409)、`unknown_release`(404)、请求体超限 413。
+错误码：`invalid_manifest`(422)、`invalid_batch`(422)、`history_mismatch`(422)、`migration_failed`(422，含 `failed_version`/`reason`，禁用 SQL——包括含未闭合字符串的脚本——也走此码而非 500)、`version_conflict`(409)、`database_busy`(503)、`unknown_alias`(404)、`unknown_checkpoint`(404)、`unknown_batch`(404)、`checkpoint_alias_mismatch`(409)、`checkpoint_corrupt`(422)、审核相关 `unauthorized`(401)、`review_required`(403)、`forbidden`(403)、`self_review`(409)、`digest_mismatch`(409)、`invalid_release_state`(409)、`unknown_release`(404)、开通相关 `invalid_provisioning_request`(422)、`invalid_alias`(422)、`unknown_source_alias`(404)、`alias_conflict`(409)、`idempotency_conflict`(409)、`unknown_provisioning`(404)、请求体超限 413。
 
 审核配置写在 `aliases.json`（凭据应通过部署机密分发，不要提交真实值）：
 
@@ -86,6 +92,17 @@ aliases.json   别名 -> 库文件映射（路径相对于该文件）
     "change-me-alice": "alice",
     "change-me-bob": "bob"
   }
+}
+```
+
+开通接口始终需要上述 `review_credentials` 中配置的 Bearer 凭据；即使 `review_enabled=false`，也不会允许匿名开通。新客户库目录单独配置，不与静态库、检查点、批次或审核仓储混用：
+
+```json
+{
+  "aliases": {"demo": "data/demo.db"},
+  "review_credentials": {"change-me-alice": "alice"},
+  "provisioning_root": "provisioned",
+  "provisioning_dir": "provisioning"
 }
 ```
 
@@ -157,8 +174,23 @@ curl -s -X POST http://127.0.0.1:8011/releases/$REL_ID/approve \
   -d "{\"content_sha256\":\"$SHA\"}"
 
 # 16. 执行只提交发布单 ID；重复调用返回同一个 batch_id
-curl -s -X POST http://127.0.0.1:8011/releases/$REL_ID/execute
-curl -s -X POST http://127.0.0.1:8011/releases/$REL_ID/execute
+curl -s -X POST http://127.0.0.1:8011/releases/$REL_ID/execute \
+  -H 'Authorization: Bearer change-me-alice'
+curl -s -X POST http://127.0.0.1:8011/releases/$REL_ID/execute \
+  -H 'Authorization: Bearer change-me-alice'
+
+# 17. 从成功发布单中的 demo 清单开通空客户库；不提交 SQL 或路径
+curl -s -X POST http://127.0.0.1:8011/provisionings \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer change-me-alice' \
+  -d '{"release_id":"'"$REL_ID"'","source_alias":"demo","new_alias":"customer_a","idempotency_key":"customer_a_v1"}'
+
+# 18. 新别名立即按原版本接口查询；重复开通请求返回同一记录
+curl -s http://127.0.0.1:8011/databases/customer_a/version
+curl -s -X POST http://127.0.0.1:8011/provisionings \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer change-me-alice' \
+  -d '{"release_id":"'"$REL_ID"'","source_alias":"demo","new_alias":"customer_a","idempotency_key":"customer_a_v1"}'
 ```
 
 ## 测试
@@ -167,7 +199,7 @@ curl -s -X POST http://127.0.0.1:8011/releases/$REL_ID/execute
 .venv/bin/python -m pytest -q
 ```
 
-覆盖：词法切分（字符串/注释分号、触发器多语句、CASE..END）、历史摘要核对、遗漏/改写拒绝、预期版本冲突、整批回滚、外键违反回滚、禁止语句与禁止函数、未闭合字符串折算为业务错误、迁移记录表写入/建触发器拒绝、请求体限制、重启读取真实记录、多库批次成功/失败补偿/未执行库/准备失败不升级/校验拒绝/补偿不完全不谎报/文件读写异常不中断其余库恢复/批次日志重启未决标记，以及审核模式旁路关闭、凭据身份、自审/错摘要拒绝、批准后漂移、撤销终态、重复执行同一批次和发布单持久化。
+覆盖：词法切分（字符串/注释分号、触发器多语句、CASE..END）、历史摘要核对、遗漏/改写拒绝、预期版本冲突、整批回滚、外键违反回滚、禁止语句与禁止函数、未闭合字符串折算为业务错误、迁移记录表写入/建触发器拒绝、请求体限制、重启读取真实记录、多库批次成功/失败补偿/未执行库/准备失败不升级/校验拒绝/补偿不完全不谎报/文件读写异常不中断其余库恢复/批次日志重启未决标记，以及审核模式旁路关闭、凭据身份、自审/错摘要拒绝、批准后漂移、撤销终态、重复执行同一批次、发布单执行鉴权、发布单持久化、成功发布单开通空库、来源摘要保留、幂等冲突、别名/路径冲突和重启恢复。
 
 ## 可调环境变量
 
@@ -179,6 +211,8 @@ curl -s -X POST http://127.0.0.1:8011/releases/$REL_ID/execute
 - `MIGRATION_BATCH_DIR`（批次日志目录，默认 `<配置目录>/batches`，必须在应用库之外）
 - `MIGRATION_REVIEW_ENABLED`（`1/true/yes/on` 启用；未设置时读取配置文件 `review_enabled`，默认关闭）
 - `MIGRATION_REVIEW_DIR`（审核仓储目录，默认 `<配置目录>/reviews`，必须在应用库之外）
+- `MIGRATION_PROVISIONING_ROOT`（新客户库文件根目录，默认 `<配置目录>/provisioned`；新库文件为 `<root>/<安全别名>.db`）
+- `MIGRATION_PROVISIONING_DIR`（开通记录 SQLite 仓储目录，默认 `<配置目录>/provisioning`，必须在新客户库和应用库之外）
 
 ## 说明与边界
 

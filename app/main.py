@@ -26,6 +26,7 @@ from .engine import (
     status,
 )
 from .manifest import MigrationManifest
+from .provisioning import ProvisioningError, ProvisioningRequest, ProvisioningStore
 from .review import DecisionRequest, ReviewError, ReviewStore
 
 settings = load_settings()
@@ -39,6 +40,7 @@ reviews = ReviewStore(
     batch_journal,
     batches,
 )
+provisionings = ProvisioningStore(settings, reviews, registry)
 # 重启后发现未结束批次：标为未决，不自动重放 SQL、不宣称成功。
 batch_journal.mark_unfinished_undecided()
 reviews.reconcile_unfinished()
@@ -96,6 +98,14 @@ async def _migration_error_handler(_: Request, exc: MigrationError) -> JSONRespo
 
 @app.exception_handler(ReviewError)
 async def _review_error_handler(_: Request, exc: ReviewError) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail, "code": exc.code},
+    )
+
+
+@app.exception_handler(ProvisioningError)
+async def _provisioning_error_handler(_: Request, exc: ProvisioningError) -> JSONResponse:
     return JSONResponse(
         status_code=exc.status_code,
         content={"detail": exc.detail, "code": exc.code},
@@ -337,8 +347,7 @@ async def cancel_release(release_id: str, request: Request):
 @app.post("/releases/{release_id}/execute")
 async def execute_release(release_id: str, request: Request):
     # 执行触发不接受方案或署名；只允许路径中的发布单 ID。
-    if request.headers.get("authorization"):
-        _actor(request)
+    _actor(request)
     result = reviews.execute(release_id)
     status_code = int(result.pop("http_status_code", 0) or 0)
     if status_code == 0:
@@ -356,3 +365,35 @@ async def execute_release(release_id: str, request: Request):
         else:
             status_code = 422
     return JSONResponse(status_code=status_code, content=result)
+
+
+@app.post("/provisionings", status_code=201)
+async def create_provisioning(request: Request):
+    actor = _actor(request)
+    raw = await request.body()
+    if len(raw) > MAX_REQUEST_BYTES:
+        return JSONResponse(
+            status_code=413,
+            content={"detail": f"request body too large (> {MAX_REQUEST_BYTES} bytes)"},
+        )
+    try:
+        payload = ProvisioningRequest.model_validate_json(raw)
+    except ValidationError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={"detail": jsonable_encoder(exc.errors()), "code": "invalid_provisioning_request"},
+        )
+    status_code, result = provisionings.provision(payload, actor)
+    return JSONResponse(status_code=status_code, content=result)
+
+
+@app.get("/provisionings")
+async def list_provisionings(request: Request):
+    actor = _actor(request)
+    return provisionings.list(actor)
+
+
+@app.get("/provisionings/{provisioning_id}")
+async def get_provisioning(provisioning_id: str, request: Request):
+    actor = _actor(request)
+    return provisionings.get(provisioning_id, actor)

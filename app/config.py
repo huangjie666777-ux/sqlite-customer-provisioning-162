@@ -27,6 +27,8 @@ class Settings:
     aliases: dict[str, Path]
     checkpoint_dir: Path
     batch_dir: Path
+    provisioning_root: Path
+    provisioning_dir: Path
     review_enabled: bool
     review_credentials: dict[str, str]
     review_dir: Path
@@ -73,6 +75,34 @@ def load_settings(path: str | os.PathLike[str] | None = None) -> Settings:
     for alias, db_path in aliases.items():
         if db_path == batch_dir or batch_dir in db_path.parents:
             raise ValueError(f"batch_dir must not contain database files: {alias}")
+    raw_provisioning_root = (
+        os.environ.get("MIGRATION_PROVISIONING_ROOT") or raw.get("provisioning_root")
+    )
+    if raw_provisioning_root:
+        provisioning_root = Path(raw_provisioning_root)
+        if not provisioning_root.is_absolute():
+            provisioning_root = cfg_path.parent / provisioning_root
+    else:
+        provisioning_root = cfg_path.parent / "provisioned"
+    provisioning_root = provisioning_root.resolve()
+    for alias, db_path in aliases.items():
+        if db_path == provisioning_root or provisioning_root in db_path.parents:
+            raise ValueError(f"provisioning_root must not contain static databases: {alias}")
+    raw_provisioning_dir = (
+        os.environ.get("MIGRATION_PROVISIONING_DIR") or raw.get("provisioning_dir")
+    )
+    if raw_provisioning_dir:
+        provisioning_dir = Path(raw_provisioning_dir)
+        if not provisioning_dir.is_absolute():
+            provisioning_dir = cfg_path.parent / provisioning_dir
+    else:
+        provisioning_dir = cfg_path.parent / "provisioning"
+    provisioning_dir = provisioning_dir.resolve()
+    for alias, db_path in aliases.items():
+        if db_path == provisioning_dir or provisioning_dir in db_path.parents:
+            raise ValueError(f"provisioning_dir must not contain database files: {alias}")
+    if provisioning_dir == provisioning_root or provisioning_root in provisioning_dir.parents:
+        raise ValueError("provisioning_dir must not contain customer database files")
     enabled_env = os.environ.get("MIGRATION_REVIEW_ENABLED")
     review_enabled = (
         enabled_env.lower() in {"1", "true", "yes", "on"}
@@ -106,6 +136,8 @@ def load_settings(path: str | os.PathLike[str] | None = None) -> Settings:
         aliases=aliases,
         checkpoint_dir=checkpoint_dir,
         batch_dir=batch_dir,
+        provisioning_root=provisioning_root,
+        provisioning_dir=provisioning_dir,
         review_enabled=review_enabled,
         review_credentials=review_credentials,
         review_dir=review_dir,
