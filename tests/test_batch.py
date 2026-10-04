@@ -256,9 +256,7 @@ def test_compensation_incomplete_not_reported_as_full_rollback(tmp_path):
 
     def flaky_restore(alias, *args, **kwargs):
         if alias == "a":
-            from app.checkpoints import CheckpointError
-
-            raise CheckpointError("simulated restore failure")
+            raise OSError("simulated restore file failure")
         return original_restore(alias, *args, **kwargs)
 
     checkpoints.restore = flaky_restore

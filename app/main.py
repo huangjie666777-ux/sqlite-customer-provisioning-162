@@ -26,14 +26,22 @@ from .engine import (
     status,
 )
 from .manifest import MigrationManifest
+from .review import DecisionRequest, ReviewError, ReviewStore
 
 settings = load_settings()
 registry = DatabaseRegistry()
 checkpoints = CheckpointStore(settings.checkpoint_dir)
 batch_journal = BatchJournal(settings.batch_dir)
 batches = BatchCoordinator(settings, registry, checkpoints, batch_journal)
+reviews = ReviewStore(
+    settings.review_dir,
+    settings.review_credentials,
+    batch_journal,
+    batches,
+)
 # 重启后发现未结束批次：标为未决，不自动重放 SQL、不宣称成功。
 batch_journal.mark_unfinished_undecided()
+reviews.reconcile_unfinished()
 
 app = FastAPI(title="SQLite Migration Backend", version="1.0.0")
 
@@ -86,6 +94,37 @@ async def _migration_error_handler(_: Request, exc: MigrationError) -> JSONRespo
     return JSONResponse(status_code=status_code, content=payload)
 
 
+@app.exception_handler(ReviewError)
+async def _review_error_handler(_: Request, exc: ReviewError) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail, "code": exc.code},
+    )
+
+
+def _review_disabled_response() -> JSONResponse | None:
+    if settings.review_enabled:
+        return JSONResponse(
+            status_code=403,
+            content={
+                "detail": "review mode is enabled; direct execution is disabled",
+                "code": "review_required",
+            },
+        )
+    return None
+
+
+def _actor(request: Request) -> str:
+    return reviews.person_for(request.headers.get("authorization"))
+
+
+def _invalid_decision(exc: ValidationError) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={"detail": jsonable_encoder(exc.errors()), "code": "invalid_decision"},
+    )
+
+
 def _resolve(alias: str):
     db_path = settings.aliases.get(alias)
     if db_path is None:
@@ -97,7 +136,11 @@ def _resolve(alias: str):
 
 @app.get("/health")
 async def health() -> dict:
-    return {"ok": True, "aliases": sorted(settings.aliases)}
+    return {
+        "ok": True,
+        "aliases": sorted(settings.aliases),
+        "review_enabled": settings.review_enabled,
+    }
 
 
 @app.get("/databases/{alias}/version")
@@ -110,6 +153,9 @@ async def get_version(alias: str):
 
 @app.post("/databases/{alias}/migrate")
 async def migrate(alias: str, request: Request):
+    blocked = _review_disabled_response()
+    if blocked is not None:
+        return blocked
     resolved = _resolve(alias)
     if isinstance(resolved, JSONResponse):
         return resolved
@@ -160,6 +206,9 @@ async def list_checkpoints(alias: str):
 
 @app.post("/databases/{alias}/restore")
 async def restore_checkpoint(alias: str, request: Request):
+    blocked = _review_disabled_response()
+    if blocked is not None:
+        return blocked
     resolved = _resolve(alias)
     if isinstance(resolved, JSONResponse):
         return resolved
@@ -189,6 +238,9 @@ async def restore_checkpoint(alias: str, request: Request):
 @app.post("/batches")
 async def submit_batch(request: Request):
     """多库关联发布：统一准备、按序迁移、失败逆序补偿。"""
+    blocked = _review_disabled_response()
+    if blocked is not None:
+        return blocked
     raw = await request.body()
     if len(raw) > MAX_REQUEST_BYTES:
         return JSONResponse(
@@ -220,3 +272,87 @@ async def get_batch(batch_id: str):
             content={"detail": f"unknown batch: {batch_id}", "code": "unknown_batch"},
         )
     return detail
+
+
+@app.post("/releases", status_code=201)
+async def create_release(request: Request):
+    actor = _actor(request)
+    raw = await request.body()
+    if len(raw) > MAX_REQUEST_BYTES:
+        return JSONResponse(
+            status_code=413,
+            content={"detail": f"request body too large (> {MAX_REQUEST_BYTES} bytes)"},
+        )
+    try:
+        batch_request = BatchRequest.model_validate_json(raw)
+    except ValidationError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={"detail": jsonable_encoder(exc.errors()), "code": "invalid_release"},
+        )
+    validated = batches.validate_request(batch_request)
+    if isinstance(validated, tuple):
+        return JSONResponse(status_code=validated[0], content=validated[1])
+    return reviews.create(batch_request, actor)
+
+
+@app.get("/releases")
+async def list_releases(request: Request):
+    _actor(request)
+    return {"releases": reviews.list()}
+
+
+@app.get("/releases/{release_id}")
+async def get_release(release_id: str, request: Request):
+    _actor(request)
+    return reviews.get(release_id)
+
+
+@app.post("/releases/{release_id}/approve")
+async def approve_release(release_id: str, request: Request):
+    actor = _actor(request)
+    try:
+        payload = DecisionRequest.model_validate_json(await request.body())
+    except ValidationError as exc:
+        return _invalid_decision(exc)
+    return reviews.decide(release_id, actor, True, payload.content_sha256)
+
+
+@app.post("/releases/{release_id}/reject")
+async def reject_release(release_id: str, request: Request):
+    actor = _actor(request)
+    try:
+        payload = DecisionRequest.model_validate_json(await request.body())
+    except ValidationError as exc:
+        return _invalid_decision(exc)
+    return reviews.decide(release_id, actor, False, payload.content_sha256)
+
+
+@app.post("/releases/{release_id}/cancel")
+async def cancel_release(release_id: str, request: Request):
+    actor = _actor(request)
+    return reviews.cancel(release_id, actor)
+
+
+@app.post("/releases/{release_id}/execute")
+async def execute_release(release_id: str, request: Request):
+    # 执行触发不接受方案或署名；只允许路径中的发布单 ID。
+    if request.headers.get("authorization"):
+        _actor(request)
+    result = reviews.execute(release_id)
+    status_code = int(result.pop("http_status_code", 0) or 0)
+    if status_code == 0:
+        batch_result = result.get("result") or {}
+        batch_status = batch_result.get("status")
+        code = batch_result.get("code")
+        if batch_status == "succeeded":
+            status_code = 200
+        elif code == "version_conflict":
+            status_code = 409
+        elif code == "database_busy":
+            status_code = 503
+        elif batch_status in {"execution_failed", "undecided"}:
+            status_code = 500
+        else:
+            status_code = 422
+    return JSONResponse(status_code=status_code, content=result)

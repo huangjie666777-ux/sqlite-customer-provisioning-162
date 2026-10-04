@@ -27,6 +27,9 @@ class Settings:
     aliases: dict[str, Path]
     checkpoint_dir: Path
     batch_dir: Path
+    review_enabled: bool
+    review_credentials: dict[str, str]
+    review_dir: Path
 
 
 def load_settings(path: str | os.PathLike[str] | None = None) -> Settings:
@@ -70,4 +73,40 @@ def load_settings(path: str | os.PathLike[str] | None = None) -> Settings:
     for alias, db_path in aliases.items():
         if db_path == batch_dir or batch_dir in db_path.parents:
             raise ValueError(f"batch_dir must not contain database files: {alias}")
-    return Settings(aliases=aliases, checkpoint_dir=checkpoint_dir, batch_dir=batch_dir)
+    enabled_env = os.environ.get("MIGRATION_REVIEW_ENABLED")
+    review_enabled = (
+        enabled_env.lower() in {"1", "true", "yes", "on"}
+        if enabled_env is not None
+        else bool(raw.get("review_enabled", False))
+    )
+    credentials = raw.get("review_credentials", {})
+    if not isinstance(credentials, dict):
+        raise ValueError("review_credentials must map credentials to person names")
+    review_credentials = {}
+    for credential, person in credentials.items():
+        if not isinstance(credential, str) or not credential.strip():
+            raise ValueError("review credential must be a non-empty string")
+        if not isinstance(person, str) or not person.strip():
+            raise ValueError("review person must be a non-empty string")
+        review_credentials[credential] = person.strip()
+    if review_enabled and len(review_credentials) < 2:
+        raise ValueError("review mode requires at least two configured credentials")
+    raw_review = os.environ.get("MIGRATION_REVIEW_DIR") or raw.get("review_dir")
+    if raw_review:
+        review_dir = Path(raw_review)
+        if not review_dir.is_absolute():
+            review_dir = cfg_path.parent / review_dir
+    else:
+        review_dir = cfg_path.parent / "reviews"
+    review_dir = review_dir.resolve()
+    for alias, db_path in aliases.items():
+        if db_path == review_dir or review_dir in db_path.parents:
+            raise ValueError(f"review_dir must not contain database files: {alias}")
+    return Settings(
+        aliases=aliases,
+        checkpoint_dir=checkpoint_dir,
+        batch_dir=batch_dir,
+        review_enabled=review_enabled,
+        review_credentials=review_credentials,
+        review_dir=review_dir,
+    )

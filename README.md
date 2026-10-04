@@ -22,6 +22,9 @@
 - **失败补偿**：任一库迁移失败即停止后续库，已升级库按**逆序**恢复到各自检查点（结构、数据、迁移历史一起回退）；失败库保持原状态，未执行库不升级。单个补偿失败仍继续恢复其余库，响应逐库标注 `migrated/restored/restore_failed/failed/not_executed` 并保留错误与检查点 ID，部分补偿记为 `compensation_incomplete`，不会谎报为全部回滚。
 - **互斥与单进程**：批次持有一把全局批次锁串行化，再按别名字典序一次性持有全部涉及库的锁，与单库迁移/检查点/恢复互斥；重叠批次不交叉执行，锁顺序一致不会死锁。发布期间应用停写由调用方配合，协调只保证单进程。
 - **批次日志**：服务生成批次 ID，计划、每个准备/迁移/补偿步骤与最终结果逐步写入应用库之外的 `batch_dir/journal.db`（独立 SQLite，WAL）。`GET /batches`、`GET /batches/{id}` 可随时查询，重启后历史仍在；重启时发现未结束批次标记为 `undecided`，不自动重放 SQL、不宣称成功。
+- **双人审核发布**（`app/review.py`，默认关闭）：开启后，创建发布单必须携带服务端配置的 Bearer 凭据；人员只由凭据映射决定，不接受请求内署名。发布单保存有序库别名、预期版本、完整清单、原始 SQL 与规范化内容 SHA256，一经提交不可修改。另一人批准时必须回传所查看的 SHA256；作者不能审核，摘要不符或并发状态变化均拒绝。作者可在执行开始前撤销；批准/拒绝/撤销/执行通过 SQLite 条件更新和进程内条件变量收敛到一致终态。
+- **按单执行与防偷换**：执行请求只包含发布单 ID，协调器从仓储读取批准时的原始方案，不接受请求携带 SQL。执行在原有全局批次锁和库锁内重新预检版本与历史，审批后库已变化则不执行；并发/重复执行最多关联一个批次并返回同一结果。失败终态不自动重跑；服务在执行中断后将发布单与批次标记为 `undecided`，不重放 SQL、不虚报成功，批次关联不丢失。
+- **审核模式旁路关闭**：启用审核后，`POST /batches`、单库 `POST /migrate` 与 `POST /restore` 均返回 403；检查点查询和版本读取仍可用于审计。未启用时原接口和行为保持不变。
 
 ## 目录结构
 
@@ -34,6 +37,7 @@ app/
   engine.py      版本读取、历史核对、事务化应用
   checkpoints.py 检查点快照、目录持久化与原子恢复
   batch.py       多库批次协调、批次日志持久化与失败补偿
+  review.py      双人审核发布单、凭据身份和审核状态流
   main.py        FastAPI 路由
 scripts/make_example_db.py  生成示例库
 examples/      演示用清单
@@ -52,6 +56,12 @@ aliases.json   别名 -> 库文件映射（路径相对于该文件）
 - `POST /batches` — 多库关联发布，请求体 `{"databases": [{"alias", "expected_version", "scripts": [...]}]}`；成功返回每库 `before_version/after_version/checkpoint_id`，失败返回逐库状态与补偿结果
 - `GET  /batches` — 列出全部批次（ID、状态、时间）
 - `GET  /batches/{batch_id}` — 批次详情：计划、逐步事件、最终结果
+- `POST /releases` — 审核模式下创建发布单（Bearer 凭据；请求体同 `/batches`）
+- `GET  /releases` / `GET /releases/{release_id}` — 查询发布单、审核事件、批次关联和结果
+- `POST /releases/{release_id}/approve` — 他人批准，请求体 `{"content_sha256": "..."}`
+- `POST /releases/{release_id}/reject` — 他人拒绝，携带同一内容摘要；作者审核或摘要不符均拒绝
+- `POST /releases/{release_id}/cancel` — 作者撤销尚未开始执行的发布单
+- `POST /releases/{release_id}/execute` — 仅路径包含发布单 ID，不接受 SQL 或方案；重复调用返回同一批次结果
 
 请求体：
 
@@ -64,7 +74,20 @@ aliases.json   别名 -> 库文件映射（路径相对于该文件）
 }
 ```
 
-错误码：`invalid_manifest`(422)、`invalid_batch`(422)、`history_mismatch`(422)、`migration_failed`(422，含 `failed_version`/`reason`，禁用 SQL——包括含未闭合字符串的脚本——也走此码而非 500)、`version_conflict`(409)、`database_busy`(503)、`unknown_alias`(404)、`unknown_checkpoint`(404)、`unknown_batch`(404)、`checkpoint_alias_mismatch`(409)、`checkpoint_corrupt`(422)、请求体超限 413。
+错误码：`invalid_manifest`(422)、`invalid_batch`(422)、`history_mismatch`(422)、`migration_failed`(422，含 `failed_version`/`reason`，禁用 SQL——包括含未闭合字符串的脚本——也走此码而非 500)、`version_conflict`(409)、`database_busy`(503)、`unknown_alias`(404)、`unknown_checkpoint`(404)、`unknown_batch`(404)、`checkpoint_alias_mismatch`(409)、`checkpoint_corrupt`(422)、审核相关 `unauthorized`(401)、`review_required`(403)、`forbidden`(403)、`self_review`(409)、`digest_mismatch`(409)、`invalid_release_state`(409)、`unknown_release`(404)、请求体超限 413。
+
+审核配置写在 `aliases.json`（凭据应通过部署机密分发，不要提交真实值）：
+
+```json
+{
+  "review_enabled": true,
+  "aliases": {"demo": "data/demo.db", "billing": "data/billing.db"},
+  "review_credentials": {
+    "change-me-alice": "alice",
+    "change-me-bob": "bob"
+  }
+}
+```
 
 ## 运行
 
@@ -116,6 +139,26 @@ curl -s -X POST http://127.0.0.1:8011/batches \
 # 13. 查询批次（重启后仍可追溯；未结束批次重启后标为 undecided）
 curl -s http://127.0.0.1:8011/batches
 curl -s http://127.0.0.1:8011/batches/batch_...
+
+# 14. 双人审核：alice 提交（先用 review_enabled=true 配置重启服务）
+REL=$(curl -s -X POST http://127.0.0.1:8011/releases \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer change-me-alice' \
+  --data @examples/batch_success.json)
+REL_ID=$(printf '%s' "$REL" | .venv/bin/python -c 'import json,sys; print(json.load(sys.stdin)["release_id"])')
+SHA=$(printf '%s' "$REL" | .venv/bin/python -c 'import json,sys; print(json.load(sys.stdin)["content_sha256"])')
+
+# 15. bob 查看后批准自己看到的摘要；alice 本人批准会返回 409
+curl -s -H 'Authorization: Bearer change-me-bob' \
+  http://127.0.0.1:8011/releases/$REL_ID
+curl -s -X POST http://127.0.0.1:8011/releases/$REL_ID/approve \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer change-me-bob' \
+  -d "{\"content_sha256\":\"$SHA\"}"
+
+# 16. 执行只提交发布单 ID；重复调用返回同一个 batch_id
+curl -s -X POST http://127.0.0.1:8011/releases/$REL_ID/execute
+curl -s -X POST http://127.0.0.1:8011/releases/$REL_ID/execute
 ```
 
 ## 测试
@@ -124,7 +167,7 @@ curl -s http://127.0.0.1:8011/batches/batch_...
 .venv/bin/python -m pytest -q
 ```
 
-覆盖：词法切分（字符串/注释分号、触发器多语句、CASE..END）、历史摘要核对、遗漏/改写拒绝、预期版本冲突、整批回滚、外键违反回滚、禁止语句与禁止函数、未闭合字符串折算为业务错误、迁移记录表写入/建触发器拒绝、请求体限制、重启读取真实记录、多库批次成功/失败补偿/未执行库/准备失败不升级/校验拒绝/补偿不完全不谎报/批次日志重启未决标记。
+覆盖：词法切分（字符串/注释分号、触发器多语句、CASE..END）、历史摘要核对、遗漏/改写拒绝、预期版本冲突、整批回滚、外键违反回滚、禁止语句与禁止函数、未闭合字符串折算为业务错误、迁移记录表写入/建触发器拒绝、请求体限制、重启读取真实记录、多库批次成功/失败补偿/未执行库/准备失败不升级/校验拒绝/补偿不完全不谎报/文件读写异常不中断其余库恢复/批次日志重启未决标记，以及审核模式旁路关闭、凭据身份、自审/错摘要拒绝、批准后漂移、撤销终态、重复执行同一批次和发布单持久化。
 
 ## 可调环境变量
 
@@ -134,6 +177,8 @@ curl -s http://127.0.0.1:8011/batches/batch_...
 - `MIGRATION_SQLITE_TIMEOUT`（busy_timeout，默认 5 秒）
 - `MIGRATION_CHECKPOINT_DIR`（检查点目录，默认 `<配置目录>/checkpoints`，必须在应用库之外）
 - `MIGRATION_BATCH_DIR`（批次日志目录，默认 `<配置目录>/batches`，必须在应用库之外）
+- `MIGRATION_REVIEW_ENABLED`（`1/true/yes/on` 启用；未设置时读取配置文件 `review_enabled`，默认关闭）
+- `MIGRATION_REVIEW_DIR`（审核仓储目录，默认 `<配置目录>/reviews`，必须在应用库之外）
 
 ## 说明与边界
 

@@ -75,7 +75,14 @@ class BatchRequest(BaseModel):
 
 
 TERMINAL_STATUSES = frozenset(
-    {"succeeded", "prepare_failed", "compensated", "compensation_incomplete"}
+    {
+        "succeeded",
+        "prepare_failed",
+        "compensated",
+        "compensation_incomplete",
+        "execution_failed",
+        "undecided",
+    }
 )
 
 
@@ -123,6 +130,12 @@ class BatchJournal:
         return conn
 
     def create_batch(self, plan: dict) -> str:
+        batch_id = self.reserve_batch_id(plan)
+        self.add_event(batch_id, "planned", {"plan": plan})
+        return batch_id
+
+    def reserve_batch_id(self, plan: dict) -> str:
+        """先持久化批次关联，再允许外部状态机进入执行中。"""
         batch_id = "batch_%s_%s" % (
             datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
             uuid.uuid4().hex[:12],
@@ -133,8 +146,29 @@ class BatchJournal:
                 "VALUES (?, 'planned', ?, ?, ?)",
                 (batch_id, _now(), _now(), json.dumps(plan, ensure_ascii=False)),
             )
-        self.add_event(batch_id, "planned", {"plan": plan})
         return batch_id
+
+    def mark_undecided(self, batch_id: str) -> None:
+        self.set_result(
+            batch_id,
+            "undecided",
+            {"status": "undecided", "detail": "service restarted mid-batch"},
+        )
+        self.add_event(batch_id, "undecided", {"reason": "service restarted mid-batch"})
+
+    def undecided_release_links(self) -> list[tuple[str, str]]:
+        """返回重启后未决批次中已记录的审核发布单关联。"""
+        links: list[tuple[str, str]] = []
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT batch_id, plan_json FROM batches WHERE status = 'undecided'"
+            ).fetchall()
+        for row in rows:
+            plan = json.loads(row["plan_json"])
+            release_id = plan.get("release_id")
+            if release_id:
+                links.append((row["batch_id"], release_id))
+        return links
 
     def set_status(self, batch_id: str, status: str) -> None:
         with self._lock, self._connect() as conn:
@@ -249,6 +283,36 @@ class BatchCoordinator:
 
     def execute(self, request: BatchRequest):
         """执行批次，返回 (HTTP 状态码, 响应体)。业务异常不泄漏为 500。"""
+        validated = self.validate_request(request)
+        if isinstance(validated, tuple):
+            return validated
+        paths = validated
+        plan = {
+            "databases": [
+                {
+                    "alias": d.alias,
+                    "expected_version": d.expected_version,
+                    "script_versions": [s.version for s in d.scripts],
+                }
+                for d in request.databases
+            ]
+        }
+        batch_id = self._journal.create_batch(plan)
+        return self._finish_reserved(request, paths, batch_id)
+
+    def execute_reserved(self, request: BatchRequest, batch_id: str):
+        """执行已经与审核发布单持久关联的批次。"""
+        validated = self.validate_request(request)
+        if isinstance(validated, tuple):
+            status_code, payload = validated
+            payload["batch_id"] = batch_id
+            payload["status"] = "prepare_failed"
+            self._journal.set_result(batch_id, "prepare_failed", payload)
+            return status_code, payload
+        return self._finish_reserved(request, validated, batch_id)
+
+    def validate_request(self, request: BatchRequest):
+        """校验别名与宿主文件；成功返回 alias -> path，失败返回 HTTP 响应元组。"""
         unknown = [d.alias for d in request.databases if d.alias not in self._settings.aliases]
         if unknown:
             return 404, {
@@ -267,19 +331,11 @@ class BatchCoordinator:
                     "code": "invalid_batch",
                 }
             seen_paths[path] = alias
+        return paths
 
-        plan = {
-            "databases": [
-                {
-                    "alias": d.alias,
-                    "expected_version": d.expected_version,
-                    "script_versions": [s.version for s in d.scripts],
-                }
-                for d in request.databases
-            ]
-        }
-        batch_id = self._journal.create_batch(plan)
-
+    def _finish_reserved(
+        self, request: BatchRequest, paths: dict[str, Path], batch_id: str
+    ):
         # 全局批次锁保证批次互斥；别名单调加锁避免与单库操作死锁。
         with self._batch_lock:
             aliases = sorted(paths)
@@ -392,7 +448,7 @@ class BatchCoordinator:
                     expected_version=state["after_version"],
                     lock=self._registry.lock_for(alias),
                 )
-            except MigrationError as restore_exc:
+            except Exception as restore_exc:
                 state["status"] = "restore_failed"
                 state["error"] = str(restore_exc)
                 journal.add_event(
