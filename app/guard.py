@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import sqlite3
 
-from .sqlsplit import first_keyword, split_statements
+from .sqlsplit import TokenizeError, first_keyword, split_statements
 
 # 明确禁止的语句首关键字（仅匹配词法意义上的第一个裸关键字）。
 FORBIDDEN_FIRST_KEYWORDS = frozenset(
@@ -58,11 +58,19 @@ class GuardError(ValueError):
 
 def inspect_script(sql_text: str, migration_table: str) -> list[str]:
     """词法切分并在语句层拒绝事务控制/附加库/VACUUM/PRAGMA 等。"""
-    statements = split_statements(sql_text)
+    # 词法错误（如未闭合字符串）同样折算为业务错误，由引擎带上失败版本号，
+    # 不向上抛 500。
+    try:
+        statements = split_statements(sql_text)
+    except TokenizeError as exc:
+        raise GuardError(str(exc)) from exc
     if not statements:
         raise GuardError("blank migration script")
     for stmt in statements:
-        head = first_keyword(stmt)
+        try:
+            head = first_keyword(stmt)
+        except TokenizeError as exc:
+            raise GuardError(str(exc)) from exc
         if head in FORBIDDEN_FIRST_KEYWORDS:
             raise GuardError(f"statement type is forbidden: {head.upper()}")
         if head == "select":

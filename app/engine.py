@@ -146,6 +146,41 @@ def apply_manifest(
         return _apply_locked(db_path, manifest)
 
 
+def preflight(db_path: Path, manifest: MigrationManifest) -> int:
+    """只检查不执行：核对预期版本与历史指纹，返回当前版本。
+
+    供多库批次的准备阶段使用；调用方须已持有该别名的锁，
+    准备与正式执行之间不会被进程内其它写入者插入。
+    """
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with closing(_connect(db_path)) as conn:
+        conn.execute("PRAGMA busy_timeout = %d" % int(SQLITE_BUSY_TIMEOUT_SECONDS * 1000))
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as exc:
+            if _is_busy(exc):
+                raise DatabaseBusy(str(exc)) from exc
+            raise
+        try:
+            _ensure_table(conn)
+            records = _read_records(conn)
+            current = records[-1].version if records else 0
+            if current != manifest.expected_version:
+                raise VersionConflict(
+                    f"expected_version={manifest.expected_version} but database is at {current}"
+                )
+            _check_history(records, manifest.scripts)
+            # 待执行脚本先做语句层校验，禁用 SQL 在准备阶段就暴露。
+            for item in manifest.scripts[current:]:
+                try:
+                    inspect_script(item.sql, MIGRATION_TABLE)
+                except GuardError as exc:
+                    raise ScriptFailed(item.version, str(exc)) from exc
+        finally:
+            conn.execute("ROLLBACK")
+    return current
+
+
 def _is_busy(exc: sqlite3.Error) -> bool:
     msg = str(exc).lower()
     return "locked" in msg or "busy" in msg

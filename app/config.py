@@ -26,6 +26,7 @@ MIGRATION_TABLE = "__schema_migration_log__"
 class Settings:
     aliases: dict[str, Path]
     checkpoint_dir: Path
+    batch_dir: Path
 
 
 def load_settings(path: str | os.PathLike[str] | None = None) -> Settings:
@@ -56,4 +57,17 @@ def load_settings(path: str | os.PathLike[str] | None = None) -> Settings:
             raise ValueError(
                 f"checkpoint_dir must not contain database files: {alias}"
             )
-    return Settings(aliases=aliases, checkpoint_dir=checkpoint_dir)
+    # 批次日志目录同样在应用库之外；默认 <配置目录>/batches，可用
+    # aliases.json 的 "batch_dir" 或 MIGRATION_BATCH_DIR 覆盖。
+    raw_batch = os.environ.get("MIGRATION_BATCH_DIR") or raw.get("batch_dir")
+    if raw_batch:
+        batch_dir = Path(raw_batch)
+        if not batch_dir.is_absolute():
+            batch_dir = cfg_path.parent / batch_dir
+    else:
+        batch_dir = cfg_path.parent / "batches"
+    batch_dir = batch_dir.resolve()
+    for alias, db_path in aliases.items():
+        if db_path == batch_dir or batch_dir in db_path.parents:
+            raise ValueError(f"batch_dir must not contain database files: {alias}")
+    return Settings(aliases=aliases, checkpoint_dir=checkpoint_dir, batch_dir=batch_dir)

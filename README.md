@@ -18,6 +18,10 @@
 - **整库恢复**：按 ID 恢复，必须携带预期当前版本且只能恢复同一别名的检查点。恢复前校验快照 SHA256 与 `PRAGMA integrity_check`，在目标旁的临时文件重建并再次校验后原子替换原库；恢复后新增对象与数据消失，版本与历史回到检查点，快照与目录保留，可再次迁移。任何失败（未知 ID、别名不符、版本冲突、快照损坏、库忙）都明确拒绝且原库不变，不留半恢复库。
 - **重启可查**：版本状态全部来自库内真实记录，服务重启后直接读取。
 - **短连接**：每次请求使用独立连接并在结束后关闭（`contextlib.closing`）。
+- **多库关联发布**（`app/batch.py`）：`POST /batches` 提交有序库列表，每项含配置别名、预期版本和完整迁移清单（与单库清单同一套校验）。空列表、重复别名、多个别名映射同一库文件、非法清单一律拒绝；HTTP 不接受宿主路径。协调器先对全部库做版本/历史/脚本检查并逐库创建检查点，**全部准备成功才按输入顺序迁移**；准备失败任何库都不升级。
+- **失败补偿**：任一库迁移失败即停止后续库，已升级库按**逆序**恢复到各自检查点（结构、数据、迁移历史一起回退）；失败库保持原状态，未执行库不升级。单个补偿失败仍继续恢复其余库，响应逐库标注 `migrated/restored/restore_failed/failed/not_executed` 并保留错误与检查点 ID，部分补偿记为 `compensation_incomplete`，不会谎报为全部回滚。
+- **互斥与单进程**：批次持有一把全局批次锁串行化，再按别名字典序一次性持有全部涉及库的锁，与单库迁移/检查点/恢复互斥；重叠批次不交叉执行，锁顺序一致不会死锁。发布期间应用停写由调用方配合，协调只保证单进程。
+- **批次日志**：服务生成批次 ID，计划、每个准备/迁移/补偿步骤与最终结果逐步写入应用库之外的 `batch_dir/journal.db`（独立 SQLite，WAL）。`GET /batches`、`GET /batches/{id}` 可随时查询，重启后历史仍在；重启时发现未结束批次标记为 `undecided`，不自动重放 SQL、不宣称成功。
 
 ## 目录结构
 
@@ -29,10 +33,11 @@ app/
   guard.py       语句层禁止项 + SQLite 授权回调
   engine.py      版本读取、历史核对、事务化应用
   checkpoints.py 检查点快照、目录持久化与原子恢复
+  batch.py       多库批次协调、批次日志持久化与失败补偿
   main.py        FastAPI 路由
 scripts/make_example_db.py  生成示例库
 examples/      演示用清单
-tests/         pytest 测试（27 项）
+tests/         pytest 测试（48 项）
 aliases.json   别名 -> 库文件映射（路径相对于该文件）
 ```
 
@@ -44,6 +49,9 @@ aliases.json   别名 -> 库文件映射（路径相对于该文件）
 - `POST /databases/{alias}/checkpoints` — 创建检查点，返回 `id/alias/version/created_at/sha256/size_bytes`
 - `GET  /databases/{alias}/checkpoints` — 列出该别名可见检查点
 - `POST /databases/{alias}/restore` — 按 ID 整库恢复，请求体 `{"checkpoint_id": "...", "expected_version": N}`
+- `POST /batches` — 多库关联发布，请求体 `{"databases": [{"alias", "expected_version", "scripts": [...]}]}`；成功返回每库 `before_version/after_version/checkpoint_id`，失败返回逐库状态与补偿结果
+- `GET  /batches` — 列出全部批次（ID、状态、时间）
+- `GET  /batches/{batch_id}` — 批次详情：计划、逐步事件、最终结果
 
 请求体：
 
@@ -56,7 +64,7 @@ aliases.json   别名 -> 库文件映射（路径相对于该文件）
 }
 ```
 
-错误码：`invalid_manifest`(422)、`history_mismatch`(422)、`migration_failed`(422，含 `failed_version`/`reason`，禁用 SQL 也走此码而非 500)、`version_conflict`(409)、`database_busy`(503)、`unknown_alias`(404)、`unknown_checkpoint`(404)、`checkpoint_alias_mismatch`(409)、`checkpoint_corrupt`(422)、请求体超限 413。
+错误码：`invalid_manifest`(422)、`invalid_batch`(422)、`history_mismatch`(422)、`migration_failed`(422，含 `failed_version`/`reason`，禁用 SQL——包括含未闭合字符串的脚本——也走此码而非 500)、`version_conflict`(409)、`database_busy`(503)、`unknown_alias`(404)、`unknown_checkpoint`(404)、`unknown_batch`(404)、`checkpoint_alias_mismatch`(409)、`checkpoint_corrupt`(422)、请求体超限 413。
 
 ## 运行
 
@@ -96,6 +104,18 @@ curl -s http://127.0.0.1:8011/databases/demo/checkpoints
 curl -s -X POST http://127.0.0.1:8011/databases/demo/restore \
   -H 'Content-Type: application/json' \
   -d `'{"checkpoint_id": "cp_...", "expected_version": 2}'`
+
+# 11. 多库关联发布：demo + billing 一起升级（全部准备成功才迁移）
+curl -s -X POST http://127.0.0.1:8011/batches \
+  -H 'Content-Type: application/json' --data @examples/batch_success.json
+
+# 12. 失败补偿演示：billing 外键违规，demo 已升级但被逆序恢复
+curl -s -X POST http://127.0.0.1:8011/batches \
+  -H 'Content-Type: application/json' --data @examples/batch_fail.json
+
+# 13. 查询批次（重启后仍可追溯；未结束批次重启后标为 undecided）
+curl -s http://127.0.0.1:8011/batches
+curl -s http://127.0.0.1:8011/batches/batch_...
 ```
 
 ## 测试
@@ -104,7 +124,7 @@ curl -s -X POST http://127.0.0.1:8011/databases/demo/restore \
 .venv/bin/python -m pytest -q
 ```
 
-覆盖：词法切分（字符串/注释分号、触发器多语句、CASE..END）、历史摘要核对、遗漏/改写拒绝、预期版本冲突、整批回滚、外键违反回滚、禁止语句与禁止函数、迁移记录表写入/建触发器拒绝、请求体限制、重启读取真实记录。
+覆盖：词法切分（字符串/注释分号、触发器多语句、CASE..END）、历史摘要核对、遗漏/改写拒绝、预期版本冲突、整批回滚、外键违反回滚、禁止语句与禁止函数、未闭合字符串折算为业务错误、迁移记录表写入/建触发器拒绝、请求体限制、重启读取真实记录、多库批次成功/失败补偿/未执行库/准备失败不升级/校验拒绝/补偿不完全不谎报/批次日志重启未决标记。
 
 ## 可调环境变量
 
@@ -113,6 +133,7 @@ curl -s -X POST http://127.0.0.1:8011/databases/demo/restore \
 - `MIGRATION_MAX_SCRIPTS`（默认 200）
 - `MIGRATION_SQLITE_TIMEOUT`（busy_timeout，默认 5 秒）
 - `MIGRATION_CHECKPOINT_DIR`（检查点目录，默认 `<配置目录>/checkpoints`，必须在应用库之外）
+- `MIGRATION_BATCH_DIR`（批次日志目录，默认 `<配置目录>/batches`，必须在应用库之外）
 
 ## 说明与边界
 

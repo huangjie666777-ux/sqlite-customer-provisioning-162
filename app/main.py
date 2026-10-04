@@ -1,4 +1,4 @@
-"""FastAPI 入口：提交迁移清单 / 查询当前版本 / 检查点与整库恢复。"""
+"""FastAPI 入口：提交迁移清单 / 查询当前版本 / 检查点与整库恢复 / 多库批次发布。"""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from .checkpoints import (
     CheckpointStore,
     UnknownCheckpoint,
 )
+from .batch import BatchCoordinator, BatchJournal, BatchRequest, UnknownBatch
 from .config import MAX_REQUEST_BYTES, load_settings
 from .engine import (
     DatabaseBusy,
@@ -29,6 +30,10 @@ from .manifest import MigrationManifest
 settings = load_settings()
 registry = DatabaseRegistry()
 checkpoints = CheckpointStore(settings.checkpoint_dir)
+batch_journal = BatchJournal(settings.batch_dir)
+batches = BatchCoordinator(settings, registry, checkpoints, batch_journal)
+# 重启后发现未结束批次：标为未决，不自动重放 SQL、不宣称成功。
+batch_journal.mark_unfinished_undecided()
 
 app = FastAPI(title="SQLite Migration Backend", version="1.0.0")
 
@@ -68,6 +73,9 @@ async def _migration_error_handler(_: Request, exc: MigrationError) -> JSONRespo
     elif isinstance(exc, CheckpointCorrupt):
         status_code = 422
         code = "checkpoint_corrupt"
+    elif isinstance(exc, UnknownBatch):
+        status_code = 404
+        code = "unknown_batch"
     else:
         status_code = 400
         code = "migration_error"
@@ -176,3 +184,39 @@ async def restore_checkpoint(alias: str, request: Request):
         "before_version": result["before_version"],
         "after_version": result["after_version"],
     }
+
+
+@app.post("/batches")
+async def submit_batch(request: Request):
+    """多库关联发布：统一准备、按序迁移、失败逆序补偿。"""
+    raw = await request.body()
+    if len(raw) > MAX_REQUEST_BYTES:
+        return JSONResponse(
+            status_code=413,
+            content={"detail": f"request body too large (> {MAX_REQUEST_BYTES} bytes)"},
+        )
+    try:
+        batch_request = BatchRequest.model_validate_json(raw)
+    except ValidationError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={"detail": jsonable_encoder(exc.errors()), "code": "invalid_batch"},
+        )
+    status_code, payload = batches.execute(batch_request)
+    return JSONResponse(status_code=status_code, content=payload)
+
+
+@app.get("/batches")
+async def list_batches() -> dict:
+    return {"batches": batch_journal.list()}
+
+
+@app.get("/batches/{batch_id}")
+async def get_batch(batch_id: str):
+    detail = batch_journal.get(batch_id)
+    if detail is None:
+        return JSONResponse(
+            status_code=404,
+            content={"detail": f"unknown batch: {batch_id}", "code": "unknown_batch"},
+        )
+    return detail
