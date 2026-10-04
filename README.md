@@ -25,6 +25,10 @@
 - **双人审核发布**（`app/review.py`，默认关闭）：开启后，创建发布单必须携带服务端配置的 Bearer 凭据；人员只由凭据映射决定，不接受请求内署名。发布单保存有序库别名、预期版本、完整清单、原始 SQL 与规范化内容 SHA256，一经提交不可修改。另一人批准时必须回传所查看的 SHA256；作者不能审核，摘要不符或并发状态变化均拒绝。作者可在执行开始前撤销；批准/拒绝/撤销/执行通过 SQLite 条件更新和进程内条件变量收敛到一致终态。
 - **按单执行与防偷换**：执行请求只包含发布单 ID，协调器从仓储读取批准时的原始方案，不接受请求携带 SQL。执行在原有全局批次锁和库锁内重新预检版本与历史，审批后库已变化则不执行；并发/重复执行最多关联一个批次并返回同一结果。失败终态不自动重跑；服务在执行中断后将发布单与批次标记为 `undecided`，不重放 SQL、不虚报成功，批次关联不丢失。
 - **审核模式旁路关闭**：启用审核后，`POST /batches`、单库 `POST /migrate` 与 `POST /restore` 均返回 403；检查点查询和版本读取仍可用于审计。未启用时原接口和行为保持不变。
+- **新客户数据库开通**（`app/provision.py`）：凭人员 Bearer 凭据提交成功发布单 ID、其中的源别名、新库别名与幂等键。服务从发布单仓储提取该源别名的完整清单（保留原始 SQL 与内容摘要），不接受请求携带新的 SQL 或宿主路径；待审、拒绝、失败或未决的发布单不可作来源。新库文件在服务端配置的开通根目录（`provision_root`，默认 `<配置目录>/data`）内以排他方式创建：别名冲突、路径越界、已有文件一律拒绝，绝不覆盖。空库创建后复用迁移引擎从版本 0 执行完整清单，不复制源库业务数据，也不改变原发布单、批次或源库。
+- **开通幂等与并发**：同一幂等键提交同一内容返回同一开通记录与结果（HTTP 200），同键换内容拒绝（409）；开通记录以唯一约束占用新别名与幂等键，并发开通同别名最多成功一次，不重复执行 SQL。失败记录保留错误，不自动重试。
+- **开通后路由**：初始化与迁移历史提交成功后才把新别名注册进别名路由，立即可用于版本查询、检查点和审核发布；处理中或失败的库不可路由。静态别名保持兼容，审核模式的旁路限制不放松。
+- **开通记录持久化**：开通 ID、人员、来源内容摘要、新别名、目标版本、状态与错误保存在应用库之外的 `provision_dir/provisions.db`（默认 `<配置目录>/provisions`），凭人员凭据查询。重启后已成功别名自动恢复路由，未完成记录标为 `undecided`，不开放、不重放 SQL。
 
 ## 目录结构
 
@@ -38,10 +42,11 @@ app/
   checkpoints.py 检查点快照、目录持久化与原子恢复
   batch.py       多库批次协调、批次日志持久化与失败补偿
   review.py      双人审核发布单、凭据身份和审核状态流
+  provision.py   新客户数据库开通、动态别名注册与开通记录持久化
   main.py        FastAPI 路由
 scripts/make_example_db.py  生成示例库
 examples/      演示用清单
-tests/         pytest 测试（48 项）
+tests/         pytest 测试（62 项）
 aliases.json   别名 -> 库文件映射（路径相对于该文件）
 ```
 
@@ -61,7 +66,9 @@ aliases.json   别名 -> 库文件映射（路径相对于该文件）
 - `POST /releases/{release_id}/approve` — 他人批准，请求体 `{"content_sha256": "..."}`
 - `POST /releases/{release_id}/reject` — 他人拒绝，携带同一内容摘要；作者审核或摘要不符均拒绝
 - `POST /releases/{release_id}/cancel` — 作者撤销尚未开始执行的发布单
-- `POST /releases/{release_id}/execute` — 仅路径包含发布单 ID，不接受 SQL 或方案；重复调用返回同一批次结果
+- `POST /releases/{release_id}/execute` — 仅路径包含发布单 ID，不接受 SQL 或方案；需 Bearer 凭据；重复调用返回同一批次结果
+- `POST /provisions` — 新客户数据库开通（Bearer 凭据），请求体 `{"release_id", "source_alias", "new_alias", "idempotency_key"}`，多一字节字段（如 `sql`/`path`）一律 422；成功 201 返回开通记录，同键同内容重放返回 200 同一记录
+- `GET  /provisions` / `GET /provisions/{provision_id}` — 凭 Bearer 凭据查询开通记录（状态、目标版本、错误）
 
 请求体：
 
@@ -74,7 +81,7 @@ aliases.json   别名 -> 库文件映射（路径相对于该文件）
 }
 ```
 
-错误码：`invalid_manifest`(422)、`invalid_batch`(422)、`history_mismatch`(422)、`migration_failed`(422，含 `failed_version`/`reason`，禁用 SQL——包括含未闭合字符串的脚本——也走此码而非 500)、`version_conflict`(409)、`database_busy`(503)、`unknown_alias`(404)、`unknown_checkpoint`(404)、`unknown_batch`(404)、`checkpoint_alias_mismatch`(409)、`checkpoint_corrupt`(422)、审核相关 `unauthorized`(401)、`review_required`(403)、`forbidden`(403)、`self_review`(409)、`digest_mismatch`(409)、`invalid_release_state`(409)、`unknown_release`(404)、请求体超限 413。
+错误码：`invalid_manifest`(422)、`invalid_batch`(422)、`history_mismatch`(422)、`migration_failed`(422，含 `failed_version`/`reason`，禁用 SQL——包括含未闭合字符串的脚本——也走此码而非 500)、`version_conflict`(409)、`database_busy`(503)、`unknown_alias`(404)、`unknown_checkpoint`(404)、`unknown_batch`(404)、`checkpoint_alias_mismatch`(409)、`checkpoint_corrupt`(422)、审核相关 `unauthorized`(401)、`review_required`(403)、`forbidden`(403)、`self_review`(409)、`digest_mismatch`(409)、`invalid_release_state`(409)、`unknown_release`(404)、开通相关 `invalid_provision`(422)、`idempotency_conflict`(409)、`alias_conflict`(409)、`unknown_source_alias`(422)、`provisioning_failed`(422)、`unknown_provision`(404)、请求体超限 413。
 
 审核配置写在 `aliases.json`（凭据应通过部署机密分发，不要提交真实值）：
 
@@ -88,6 +95,11 @@ aliases.json   别名 -> 库文件映射（路径相对于该文件）
   }
 }
 ```
+
+开通相关配置（均可选，写在 `aliases.json` 或用环境变量覆盖）：
+
+- `provision_root`（环境变量 `MIGRATION_PROVISION_ROOT`）：新库文件的开通根目录，默认 `<配置目录>/data`。新库只在该目录内以 `<新别名>.db` 排他创建。
+- `provision_dir`（环境变量 `MIGRATION_PROVISION_DIR`）：开通记录目录，默认 `<配置目录>/provisions`，必须在应用库之外。
 
 ## 运行
 
@@ -156,9 +168,25 @@ curl -s -X POST http://127.0.0.1:8011/releases/$REL_ID/approve \
   -H 'Authorization: Bearer change-me-bob' \
   -d "{\"content_sha256\":\"$SHA\"}"
 
-# 16. 执行只提交发布单 ID；重复调用返回同一个 batch_id
-curl -s -X POST http://127.0.0.1:8011/releases/$REL_ID/execute
-curl -s -X POST http://127.0.0.1:8011/releases/$REL_ID/execute
+# 16. 执行只提交发布单 ID（需凭据）；重复调用返回同一个 batch_id
+curl -s -X POST http://127.0.0.1:8011/releases/$REL_ID/execute \
+  -H 'Authorization: Bearer change-me-alice'
+curl -s -X POST http://127.0.0.1:8011/releases/$REL_ID/execute \
+  -H 'Authorization: Bearer change-me-alice'
+
+# 17. 新客户数据库开通：从成功发布单的 demo 清单初始化独立空库
+curl -s -X POST http://127.0.0.1:8011/provisions \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer change-me-alice' \
+  -d "{\"release_id\":\"$REL_ID\",\"source_alias\":\"demo\",\"new_alias\":\"customer_a\",\"idempotency_key\":\"prov-1\"}"
+
+# 18. 新别名立即可查版本/建检查点；同键同内容重放返回同一记录（200）
+curl -s http://127.0.0.1:8011/databases/customer_a/version
+curl -s -X POST http://127.0.0.1:8011/provisions \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer change-me-alice' \
+  -d "{\"release_id\":\"$REL_ID\",\"source_alias\":\"demo\",\"new_alias\":\"customer_a\",\"idempotency_key\":\"prov-1\"}"
+curl -s -H 'Authorization: Bearer change-me-alice' http://127.0.0.1:8011/provisions
 ```
 
 ## 测试
@@ -167,7 +195,7 @@ curl -s -X POST http://127.0.0.1:8011/releases/$REL_ID/execute
 .venv/bin/python -m pytest -q
 ```
 
-覆盖：词法切分（字符串/注释分号、触发器多语句、CASE..END）、历史摘要核对、遗漏/改写拒绝、预期版本冲突、整批回滚、外键违反回滚、禁止语句与禁止函数、未闭合字符串折算为业务错误、迁移记录表写入/建触发器拒绝、请求体限制、重启读取真实记录、多库批次成功/失败补偿/未执行库/准备失败不升级/校验拒绝/补偿不完全不谎报/文件读写异常不中断其余库恢复/批次日志重启未决标记，以及审核模式旁路关闭、凭据身份、自审/错摘要拒绝、批准后漂移、撤销终态、重复执行同一批次和发布单持久化。
+覆盖：词法切分（字符串/注释分号、触发器多语句、CASE..END）、历史摘要核对、遗漏/改写拒绝、预期版本冲突、整批回滚、外键违反回滚、禁止语句与禁止函数、未闭合字符串折算为业务错误、迁移记录表写入/建触发器拒绝、请求体限制、重启读取真实记录、多库批次成功/失败补偿/未执行库/准备失败不升级/校验拒绝/补偿不完全不谎报/文件读写异常不中断其余库恢复/批次日志重启未决标记，以及审核模式旁路关闭、凭据身份、自审/错摘要拒绝、批准后漂移、撤销终态、重复执行同一批次和发布单持久化，和新客户开通的空库初始化与路由、幂等重放/换内容拒绝、别名冲突、非成功发布单拒绝、多余字段拒绝、执行入口凭据要求和重启后成功别名恢复。
 
 ## 可调环境变量
 
@@ -179,6 +207,8 @@ curl -s -X POST http://127.0.0.1:8011/releases/$REL_ID/execute
 - `MIGRATION_BATCH_DIR`（批次日志目录，默认 `<配置目录>/batches`，必须在应用库之外）
 - `MIGRATION_REVIEW_ENABLED`（`1/true/yes/on` 启用；未设置时读取配置文件 `review_enabled`，默认关闭）
 - `MIGRATION_REVIEW_DIR`（审核仓储目录，默认 `<配置目录>/reviews`，必须在应用库之外）
+- `MIGRATION_PROVISION_DIR`（开通记录目录，默认 `<配置目录>/provisions`，必须在应用库之外）
+- `MIGRATION_PROVISION_ROOT`（新库开通根目录，默认 `<配置目录>/data`）
 
 ## 说明与边界
 

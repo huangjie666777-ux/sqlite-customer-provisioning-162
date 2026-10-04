@@ -274,12 +274,20 @@ class BatchCoordinator:
         registry: DatabaseRegistry,
         checkpoints: CheckpointStore,
         journal: BatchJournal,
+        alias_lookup=None,
     ) -> None:
         self._settings = settings
         self._registry = registry
         self._checkpoints = checkpoints
         self._journal = journal
+        # 可选的动态别名视图（含开通成功的新库）；缺省只用静态配置。
+        self._alias_lookup = alias_lookup
         self._batch_lock = threading.Lock()
+
+    def _aliases(self) -> dict[str, Path]:
+        if self._alias_lookup is not None:
+            return self._alias_lookup()
+        return self._settings.aliases
 
     def execute(self, request: BatchRequest):
         """执行批次，返回 (HTTP 状态码, 响应体)。业务异常不泄漏为 500。"""
@@ -313,13 +321,14 @@ class BatchCoordinator:
 
     def validate_request(self, request: BatchRequest):
         """校验别名与宿主文件；成功返回 alias -> path，失败返回 HTTP 响应元组。"""
-        unknown = [d.alias for d in request.databases if d.alias not in self._settings.aliases]
+        aliases = self._aliases()
+        unknown = [d.alias for d in request.databases if d.alias not in aliases]
         if unknown:
             return 404, {
                 "detail": "unknown alias: " + ", ".join(sorted(unknown)),
                 "code": "unknown_alias",
             }
-        paths = {d.alias: self._settings.aliases[d.alias] for d in request.databases}
+        paths = {d.alias: aliases[d.alias] for d in request.databases}
         seen_paths: dict[Path, str] = {}
         for alias, path in paths.items():
             if path in seen_paths:
@@ -443,7 +452,7 @@ class BatchCoordinator:
             try:
                 restored = self._checkpoints.restore(
                     alias,
-                    self._settings.aliases[alias],
+                    self._aliases()[alias],
                     state["checkpoint_id"],
                     expected_version=state["after_version"],
                     lock=self._registry.lock_for(alias),

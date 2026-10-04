@@ -26,22 +26,40 @@ from .engine import (
     status,
 )
 from .manifest import MigrationManifest
+from .provision import (
+    AliasRegistry,
+    ProvisionError,
+    ProvisionRequest,
+    ProvisionStore,
+)
 from .review import DecisionRequest, ReviewError, ReviewStore
 
 settings = load_settings()
 registry = DatabaseRegistry()
+alias_registry = AliasRegistry(settings.aliases)
 checkpoints = CheckpointStore(settings.checkpoint_dir)
 batch_journal = BatchJournal(settings.batch_dir)
-batches = BatchCoordinator(settings, registry, checkpoints, batch_journal)
+batches = BatchCoordinator(
+    settings, registry, checkpoints, batch_journal, alias_lookup=alias_registry.all
+)
 reviews = ReviewStore(
     settings.review_dir,
     settings.review_credentials,
     batch_journal,
     batches,
 )
+provisions = ProvisionStore(
+    settings.provision_dir,
+    settings.provision_root,
+    reviews,
+    alias_registry,
+    registry,
+)
 # 重启后发现未结束批次：标为未决，不自动重放 SQL、不宣称成功。
 batch_journal.mark_unfinished_undecided()
 reviews.reconcile_unfinished()
+# 重启恢复已成功开通的别名；未完成的开通记录标为未决，不开放、不重放。
+provisions.reconcile()
 
 app = FastAPI(title="SQLite Migration Backend", version="1.0.0")
 
@@ -102,6 +120,14 @@ async def _review_error_handler(_: Request, exc: ReviewError) -> JSONResponse:
     )
 
 
+@app.exception_handler(ProvisionError)
+async def _provision_error_handler(_: Request, exc: ProvisionError) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail, "code": exc.code},
+    )
+
+
 def _review_disabled_response() -> JSONResponse | None:
     if settings.review_enabled:
         return JSONResponse(
@@ -126,7 +152,7 @@ def _invalid_decision(exc: ValidationError) -> JSONResponse:
 
 
 def _resolve(alias: str):
-    db_path = settings.aliases.get(alias)
+    db_path = alias_registry.get(alias)
     if db_path is None:
         return JSONResponse(
             status_code=404, content={"detail": f"unknown alias: {alias}", "code": "unknown_alias"}
@@ -138,7 +164,7 @@ def _resolve(alias: str):
 async def health() -> dict:
     return {
         "ok": True,
-        "aliases": sorted(settings.aliases),
+        "aliases": sorted(alias_registry.all()),
         "review_enabled": settings.review_enabled,
     }
 
@@ -337,8 +363,7 @@ async def cancel_release(release_id: str, request: Request):
 @app.post("/releases/{release_id}/execute")
 async def execute_release(release_id: str, request: Request):
     # 执行触发不接受方案或署名；只允许路径中的发布单 ID。
-    if request.headers.get("authorization"):
-        _actor(request)
+    _actor(request)
     result = reviews.execute(release_id)
     status_code = int(result.pop("http_status_code", 0) or 0)
     if status_code == 0:
@@ -356,3 +381,36 @@ async def execute_release(release_id: str, request: Request):
         else:
             status_code = 422
     return JSONResponse(status_code=status_code, content=result)
+
+
+@app.post("/provisions")
+async def create_provision(request: Request):
+    """新客户数据库开通：凭成功发布单的固定清单初始化独立空库。"""
+    actor = _actor(request)
+    raw = await request.body()
+    if len(raw) > MAX_REQUEST_BYTES:
+        return JSONResponse(
+            status_code=413,
+            content={"detail": f"request body too large (> {MAX_REQUEST_BYTES} bytes)"},
+        )
+    try:
+        payload = ProvisionRequest.model_validate_json(raw)
+    except ValidationError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={"detail": jsonable_encoder(exc.errors()), "code": "invalid_provision"},
+        )
+    status_code, body = provisions.provision(actor, payload)
+    return JSONResponse(status_code=status_code, content=body)
+
+
+@app.get("/provisions")
+async def list_provisions(request: Request) -> dict:
+    _actor(request)
+    return {"provisions": provisions.list()}
+
+
+@app.get("/provisions/{provision_id}")
+async def get_provision(provision_id: str, request: Request):
+    _actor(request)
+    return provisions.get(provision_id)

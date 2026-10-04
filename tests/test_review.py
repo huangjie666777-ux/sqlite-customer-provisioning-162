@@ -116,14 +116,14 @@ def test_other_person_approval_then_execute_and_repeat_returns_same_batch(review
     assert r.status_code == 200
     assert r.json()["status"] == "approved"
 
-    r = client.post(f"/releases/{rel['release_id']}/execute")
+    r = client.post(f"/releases/{rel['release_id']}/execute", headers=headers("alice-token"))
     assert r.status_code == 200, r.text
     first = r.json()
     assert first["status"] == "succeeded"
     batch_id = first["batch_id"]
     assert first["result"]["batch_id"] == batch_id
 
-    r = client.post(f"/releases/{rel['release_id']}/execute")
+    r = client.post(f"/releases/{rel['release_id']}/execute", headers=headers("alice-token"))
     assert r.status_code == 200
     assert r.json()["batch_id"] == batch_id
     detail = client.get(f"/batches/{batch_id}").json()
@@ -141,7 +141,7 @@ def test_cancel_approved_release_blocks_execution(review_client):
     r = client.post(f"/releases/{rel['release_id']}/cancel", headers=headers("alice-token"))
     assert r.status_code == 200
     assert r.json()["status"] == "revoked"
-    r = client.post(f"/releases/{rel['release_id']}/execute")
+    r = client.post(f"/releases/{rel['release_id']}/execute", headers=headers("alice-token"))
     assert r.status_code == 409
     assert r.json()["code"] == "invalid_release_state"
 
@@ -164,7 +164,7 @@ def test_database_changed_after_approval_is_rejected(review_client):
     conn.commit()
     conn.close()
 
-    r = client.post(f"/releases/{rel['release_id']}/execute")
+    r = client.post(f"/releases/{rel['release_id']}/execute", headers=headers("alice-token"))
     assert r.status_code == 409
     body = r.json()
     assert body["status"] == "prepare_failed"
@@ -191,12 +191,12 @@ def test_failed_release_is_terminal_and_not_rerun(review_client):
         json={"content_sha256": rel["content_sha256"]},
         headers=headers("bob-token"),
     )
-    r = client.post(f"/releases/{rel['release_id']}/execute")
+    r = client.post(f"/releases/{rel['release_id']}/execute", headers=headers("alice-token"))
     assert r.status_code == 422
     body = r.json()
     assert body["status"] == "compensated"
     batch_id = body["batch_id"]
-    r = client.post(f"/releases/{rel['release_id']}/execute")
+    r = client.post(f"/releases/{rel['release_id']}/execute", headers=headers("alice-token"))
     assert r.status_code == 422
     assert r.json()["batch_id"] == batch_id
 

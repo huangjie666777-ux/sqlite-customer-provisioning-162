@@ -30,6 +30,8 @@ class Settings:
     review_enabled: bool
     review_credentials: dict[str, str]
     review_dir: Path
+    provision_dir: Path
+    provision_root: Path
 
 
 def load_settings(path: str | os.PathLike[str] | None = None) -> Settings:
@@ -102,6 +104,31 @@ def load_settings(path: str | os.PathLike[str] | None = None) -> Settings:
     for alias, db_path in aliases.items():
         if db_path == review_dir or review_dir in db_path.parents:
             raise ValueError(f"review_dir must not contain database files: {alias}")
+    # 开通记录目录在应用库之外；默认 <配置目录>/provisions，可用
+    # aliases.json 的 "provision_dir" 或 MIGRATION_PROVISION_DIR 覆盖。
+    raw_provision = os.environ.get("MIGRATION_PROVISION_DIR") or raw.get("provision_dir")
+    if raw_provision:
+        provision_dir = Path(raw_provision)
+        if not provision_dir.is_absolute():
+            provision_dir = cfg_path.parent / provision_dir
+    else:
+        provision_dir = cfg_path.parent / "provisions"
+    provision_dir = provision_dir.resolve()
+    for alias, db_path in aliases.items():
+        if db_path == provision_dir or provision_dir in db_path.parents:
+            raise ValueError(
+                f"provision_dir must not contain database files: {alias}"
+            )
+    # 新库文件的开通根目录；默认 <配置目录>/data，可用
+    # aliases.json 的 "provision_root" 或 MIGRATION_PROVISION_ROOT 覆盖。
+    raw_root = os.environ.get("MIGRATION_PROVISION_ROOT") or raw.get("provision_root")
+    if raw_root:
+        provision_root = Path(raw_root)
+        if not provision_root.is_absolute():
+            provision_root = cfg_path.parent / provision_root
+    else:
+        provision_root = cfg_path.parent / "data"
+    provision_root = provision_root.resolve()
     return Settings(
         aliases=aliases,
         checkpoint_dir=checkpoint_dir,
@@ -109,4 +136,6 @@ def load_settings(path: str | os.PathLike[str] | None = None) -> Settings:
         review_enabled=review_enabled,
         review_credentials=review_credentials,
         review_dir=review_dir,
+        provision_dir=provision_dir,
+        provision_root=provision_root,
     )
